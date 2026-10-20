@@ -1,0 +1,14 @@
+# Saida do script e arquivos do jogo (nunca versionar)
+BB_Restock_Mod/
+dvdroot_ps4/
+*.dcx
+*.bak
+
+# Testes
+tests/.deps/
+tests/.work/
+bin/
+obj/
+
+__pycache__/
+*.pyc
