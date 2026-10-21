@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-BB Restock - Bloodborne (shadPS4 / dump de PS4)
+BB Restock - Bloodborne (shadPS4 / bbport / dump de PS4)
 
-Gera um mod que entrega Blood Vials e Quicksilver Bullets toda vez que a area
-carrega (inclusive no respawn apos morrer). O excedente vai para o Armazem,
-entao o inventario volta sempre cheio.
+Gera um mod que, toda vez que a area carrega (inclusive no respawn apos morrer),
+completa os Blood Vials e as Quicksilver Bullets do inventario ate o maximo.
+Entrega so o que falta: nada vai para o Armazem.
 
 O que o script altera:
-  1. param/gameparam/gameparam.parambnd.dcx
-     -> adiciona 2 linhas em ItemLotParam (um lote de frascos e um de balas),
-        sem flag de coleta, para poderem ser recebidos infinitas vezes.
-  2. event/common.emevd.dcx
-     -> adiciona um evento novo que executa AwardItemLot nesses dois lotes
-        e o inicializa no evento 0 (que roda a cada carregamento de area).
+  event/common.emevd.dcx
+    -> adiciona um evento novo que, para cada item, le a quantidade que o
+       jogador carrega, calcula (maximo - quantidade) e entrega a diferenca
+       direto no inventario. O evento e inicializado no evento 0, que roda a
+       cada carregamento de area. E o mesmo padrao de instrucoes que o jogo
+       usa no evento 12101021 de m21_00_00_00.emevd.
 
 Os arquivos originais nunca sao modificados (a menos que use --install, que
 faz backup .bak antes). Requer apenas Python 3.8+ (biblioteca padrao).
@@ -33,19 +33,17 @@ import zlib
 # Constantes do Bloodborne
 # ----------------------------------------------------------------------------
 
-BLOOD_VIAL_ID = 1000          # EquipParamGoods
-QUICKSILVER_BULLET_ID = 900   # EquipParamGoods
-GOODS_CATEGORY = 4            # ITEMLOT_ITEMCATEGORY: Good
-
-ITEMLOT_PARAM_TYPE = "ITEMLOT_PARAM_ST"
-ITEMLOT_ROW_SIZE = 148
-# Lotes com IDs consecutivos sao entregues em cadeia; por isso usamos X e X+2
-# e exigimos que X..X+3 estejam livres.
-LOT_VIALS = 9990000
-LOT_BULLETS = 9990002
+BLOOD_VIAL_ID = 1000          # EquipParamGoods (maxNum 20)
+QUICKSILVER_BULLET_ID = 900   # EquipParamGoods (maxNum 20)
+EMEVD_GOODS = 3               # ItemType "Goods" nas instrucoes de evento
 RESTOCK_EVENT_ID = 9990000
 
-GAMEPARAM_REL = ("param", "gameparam", "gameparam.parambnd.dcx")
+# Valores de evento (8 flags cada) usados como variaveis temporarias.
+# Faixa 6960-6999: nao usada por nenhum evento nem script de dialogo do jogo.
+VALUE_BITS = 8
+VIALS_WANT, VIALS_HELD = 6960, 6970
+BULLETS_WANT, BULLETS_HELD = 6980, 6990
+
 COMMON_EMEVD_REL = ("event", "common.emevd.dcx")
 
 
@@ -82,265 +80,6 @@ def dcx_compress(header, payload):
     h = bytearray(header)
     struct.pack_into(">II", h, 0x1C, len(payload), len(comp))
     return bytes(h) + comp
-
-
-# ----------------------------------------------------------------------------
-# BND4
-# ----------------------------------------------------------------------------
-
-def _reverse_bits(b):
-    return int("{:08b}".format(b)[::-1], 2)
-
-
-def _read_cstr(data, off, unicode):
-    if unicode:
-        end = off
-        while data[end:end + 2] != b"\0\0":
-            end += 2
-        return data[off:end].decode("utf-16-le")
-    end = data.index(b"\0", off)
-    return data[off:end].decode("shift_jis", errors="replace")
-
-
-def bnd4_entries(data):
-    if data[:4] != b"BND4":
-        raise PatchError("Arquivo nao e BND4.")
-    if data[9]:
-        raise PatchError("BND4 big-endian nao suportado.")
-    bit_big_endian = not data[10]
-    count = struct.unpack_from("<i", data, 0x0C)[0]
-    file_header_size = struct.unpack_from("<q", data, 0x20)[0]
-    unicode = bool(data[0x30])
-    raw_fmt = data[0x31]
-    reverse = bit_big_endian or ((raw_fmt & 1) and not (raw_fmt & 0x80))
-    fmt = raw_fmt if reverse else _reverse_bits(raw_fmt)
-    has_ids, has_names = fmt & 0x02, fmt & 0x0C
-    long_offsets, has_compression = fmt & 0x10, fmt & 0x20
-
-    entries = []
-    for i in range(count):
-        p = 0x40 + i * file_header_size
-        raw_flags = data[p]
-        flags = raw_flags if bit_big_endian else _reverse_bits(raw_flags)
-        e = {"compressed": bool(flags & 0x01), "csize_pos": p + 8}
-        q = p + 16
-        e["csize"] = struct.unpack_from("<q", data, p + 8)[0]
-        e["usize_pos"] = None
-        if has_compression:
-            e["usize_pos"] = q
-            q += 8
-        e["offset_pos"], e["long_offset"] = q, bool(long_offsets)
-        if long_offsets:
-            e["offset"] = struct.unpack_from("<q", data, q)[0]
-            q += 8
-        else:
-            e["offset"] = struct.unpack_from("<I", data, q)[0]
-            q += 4
-        if has_ids:
-            q += 4
-        e["name"] = ""
-        if has_names:
-            name_off = struct.unpack_from("<I", data, q)[0]
-            e["name"] = _read_cstr(data, name_off, unicode)
-        entries.append(e)
-    return entries
-
-
-def bnd4_find(data, basename):
-    for e in bnd4_entries(data):
-        if e["name"].replace("\\", "/").split("/")[-1].lower() == basename.lower():
-            if e["compressed"]:
-                raise PatchError("Arquivo %s comprimido dentro do BND4 (nao suportado)." % basename)
-            return e
-    raise PatchError("%s nao encontrado dentro do BND4." % basename)
-
-
-def bnd4_replace(data, entry, new_bytes):
-    """Anexa o novo conteudo no fim do BND4 e aponta o cabecalho para ele.
-    Cabecalhos, nomes, tabela de hash e os demais arquivos ficam intactos."""
-    out = bytearray(data)
-    out += b"\0" * (-len(out) % 0x10)
-    offset = len(out)
-    out += new_bytes
-    struct.pack_into("<q", out, entry["csize_pos"], len(new_bytes))
-    if entry["usize_pos"] is not None:
-        struct.pack_into("<q", out, entry["usize_pos"], len(new_bytes))
-    if entry["long_offset"]:
-        struct.pack_into("<q", out, entry["offset_pos"], offset)
-    else:
-        if offset > 0xFFFFFFFF:
-            raise PatchError("BND4 grande demais.")
-        struct.pack_into("<I", out, entry["offset_pos"], offset)
-    return bytes(out)
-
-
-def bnd4_get(data, entry):
-    return data[entry["offset"]:entry["offset"] + entry["csize"]]
-
-
-# ----------------------------------------------------------------------------
-# PARAM
-# ----------------------------------------------------------------------------
-
-F2D_FLAG01, F2D_INT_DATA, F2D_LONG_DATA, F2D_OFFSET_TYPE = 0x01, 0x02, 0x04, 0x80
-
-
-class Param:
-    def __init__(self, data):
-        self.data = data
-        if data[0x2C] not in (0x00,):
-            raise PatchError("PARAM big-endian nao suportado.")
-        f2d = self.f2d = data[0x2D]
-        self.f2e = data[0x2E]
-        self.row_count = struct.unpack_from("<H", data, 0x0A)[0]
-        self.short_data_start = not ((f2d & F2D_FLAG01 and f2d & F2D_INT_DATA) or f2d & F2D_LONG_DATA)
-        self.long = bool(f2d & F2D_LONG_DATA)
-
-        if f2d & F2D_OFFSET_TYPE:
-            type_off = struct.unpack_from("<q", data, 0x10)[0]
-            self.param_type = data[type_off:data.index(b"\0", type_off)].decode("ascii")
-        else:
-            self.param_type = data[0x0C:0x2C].split(b"\0")[0].split(b" ")[0].decode("ascii", "replace")
-
-        if f2d & F2D_FLAG01 and f2d & F2D_INT_DATA:
-            self.data_start_hdr = struct.unpack_from("<I", data, 0x30)[0]
-            self.rows_start = 0x40
-        elif self.long:
-            self.data_start_hdr = struct.unpack_from("<q", data, 0x30)[0]
-            self.rows_start = 0x40
-        else:
-            self.data_start_hdr = struct.unpack_from("<H", data, 0x04)[0]
-            self.rows_start = 0x30
-
-        if self.row_count < 2:
-            raise PatchError("PARAM com poucas linhas; formato inesperado.")
-        first_data = self._raw_data_offset(self.rows_start)
-        named_size = 24 if self.long else 12
-        self.named = (first_data - self.rows_start) >= self.row_count * named_size
-        self.hdr_size = (24 if self.named else 16) if self.long else (12 if self.named else 8)
-        if not self.short_data_start and self.rows_start + self.hdr_size > self.data_start_hdr:
-            raise PatchError("PARAM sem cabecalhos de linha (nao suportado).")
-
-        self.ids, self.offsets, self.names = [], [], []
-        for i in range(self.row_count):
-            p = self.rows_start + i * self.hdr_size
-            self.ids.append(struct.unpack_from("<i", data, p)[0])
-            if self.long:
-                self.offsets.append(struct.unpack_from("<q", data, p + 8)[0])
-                self.names.append(struct.unpack_from("<q", data, p + 16)[0] if self.named else None)
-            else:
-                self.offsets.append(struct.unpack_from("<I", data, p + 4)[0])
-                self.names.append(struct.unpack_from("<I", data, p + 8)[0] if self.named else None)
-
-        self.row_size = self.offsets[1] - self.offsets[0]
-        for i, off in enumerate(self.offsets):
-            if off != self.offsets[0] + i * self.row_size:
-                raise PatchError("Dados do PARAM nao sao contiguos; formato inesperado.")
-        for a, b in zip(self.ids, self.ids[1:]):
-            if b < a:
-                raise PatchError("IDs do PARAM fora de ordem; formato inesperado.")
-        self.data_end = self.offsets[-1] + self.row_size
-
-    def _raw_data_offset(self, p):
-        if self.long:
-            return struct.unpack_from("<q", self.data, p + 8)[0]
-        return struct.unpack_from("<I", self.data, p + 4)[0]
-
-    def row(self, row_id):
-        i = self.ids.index(row_id)
-        return self.data[self.offsets[i]:self.offsets[i] + self.row_size]
-
-    def _empty_name_offset(self):
-        unicode = bool(self.f2e & 0x01)
-        terminator = b"\0\0" if unicode else b"\0"
-        for off in self.names:
-            if off and off < len(self.data) and self.data[off:off + len(terminator)] == terminator:
-                return off
-        return 0
-
-    def with_rows(self, new_rows):
-        """Retorna os bytes do PARAM com as linhas novas {id: bytes} inseridas."""
-        rows = list(zip(self.ids, [self.data[o:o + self.row_size] for o in self.offsets], self.names))
-        for rid, rbytes in new_rows.items():
-            if rid in self.ids:
-                raise PatchError("Linha %d ja existe em %s." % (rid, self.param_type))
-            if len(rbytes) != self.row_size:
-                raise PatchError("Tamanho de linha incorreto.")
-        empty_name = self._empty_name_offset() if self.named else None
-        added = len(new_rows)
-        if self.row_count + added > 0xFFFF:
-            raise PatchError("PARAM cheio.")
-        for rid, rbytes in new_rows.items():
-            rows.append((rid, rbytes, "NEW"))
-        rows.sort(key=lambda r: r[0])
-
-        hdr_growth = added * self.hdr_size
-        tail_shift = hdr_growth + added * self.row_size
-        old_hdr_end = self.rows_start + self.row_count * self.hdr_size
-        gap = self.data[old_hdr_end:self.offsets[0]]
-        tail = self.data[self.data_end:]
-        new_data_start = self.offsets[0] + hdr_growth
-
-        def shift_tail(off):
-            if off is None:
-                return None
-            if off >= self.data_end:
-                return off + tail_shift
-            if off == 0:
-                return 0
-            raise PatchError("Offset de nome inesperado no PARAM.")
-
-        new_empty = shift_tail(empty_name) if empty_name else 0
-
-        head = bytearray(self.data[:self.rows_start])
-        struct.pack_into("<H", head, 0x0A, len(rows))
-        strings_off = struct.unpack_from("<I", head, 0)[0]
-        if strings_off >= self.data_end:
-            struct.pack_into("<I", head, 0, strings_off + tail_shift)
-        if self.f2d & F2D_OFFSET_TYPE:
-            type_off = struct.unpack_from("<q", head, 0x10)[0]
-            struct.pack_into("<q", head, 0x10, shift_tail(type_off))
-        if self.f2d & F2D_FLAG01 and self.f2d & F2D_INT_DATA:
-            struct.pack_into("<I", head, 0x30, self.data_start_hdr + hdr_growth)
-        elif self.long:
-            struct.pack_into("<q", head, 0x30, self.data_start_hdr + hdr_growth)
-        else:
-            struct.pack_into("<H", head, 0x04, (self.data_start_hdr + hdr_growth) & 0xFFFF)
-
-        headers = bytearray()
-        body = bytearray()
-        for j, (rid, rbytes, name) in enumerate(rows):
-            data_off = new_data_start + j * self.row_size
-            name_off = new_empty if name == "NEW" else shift_tail(name)
-            if self.long:
-                headers += struct.pack("<iiq", rid, 0, data_off)
-                if self.named:
-                    headers += struct.pack("<q", name_off)
-            else:
-                headers += struct.pack("<iI", rid, data_off)
-                if self.named:
-                    headers += struct.pack("<I", name_off)
-            body += rbytes
-        return bytes(head) + bytes(headers) + gap + bytes(body) + tail
-
-
-def make_itemlot_row(item_id, quantity):
-    if not 1 <= quantity <= 99:
-        raise PatchError("Quantidade deve estar entre 1 e 99.")
-    item_ids = [item_id] + [0] * 7
-    categories = [GOODS_CATEGORY] + [0] * 7
-    base_points = [1000] + [0] * 7          # 100% de chance no slot 1
-    cumulate_points = [0] * 8
-    slot_flags = [0] * 8                    # 0 = usa a flag principal
-    get_item_flag = -1                      # <0 = sem flag: pode ser recebido sempre
-    cumulate_flag = -1
-    nums = [quantity] + [0] * 7
-    bitfield = 0                            # enableLuck/cumulateReset desligados
-    row = struct.pack("<8i8i8H8H8iiiBB8BH",
-                      *item_ids, *categories, *base_points, *cumulate_points,
-                      *slot_flags, get_item_flag, cumulate_flag, 0, 0, *nums, bitfield)
-    assert len(row) == ITEMLOT_ROW_SIZE
-    return row
 
 
 # ----------------------------------------------------------------------------
@@ -472,41 +211,30 @@ class Emevd:
 # Patch
 # ----------------------------------------------------------------------------
 
-def patch_gameparam(raw, vials, bullets):
-    header, bnd = dcx_decompress(raw)
-    entry = bnd4_find(bnd, "ItemLotParam.param")
-    param = Param(bnd4_get(bnd, entry))
-    if param.param_type != ITEMLOT_PARAM_TYPE:
-        raise PatchError("ItemLotParam com tipo inesperado: %s" % param.param_type)
-    if param.row_size != ITEMLOT_ROW_SIZE:
-        raise PatchError("ItemLotParam com tamanho de linha %d (esperado %d). Versao do jogo diferente?"
-                         % (param.row_size, ITEMLOT_ROW_SIZE))
-    for rid in range(LOT_VIALS, LOT_VIALS + 4):
-        if rid in param.ids:
-            raise PatchError("Linha %d ja existe em ItemLotParam. Os arquivos ja foram modificados? "
-                             "Use os arquivos originais do jogo." % rid)
-    new_param = param.with_rows({
-        LOT_VIALS: make_itemlot_row(BLOOD_VIAL_ID, vials),
-        LOT_BULLETS: make_itemlot_row(QUICKSILVER_BULLET_ID, bullets),
-    })
-
-    # Verificacao: reler e comparar todas as linhas
-    check = Param(new_param)
-    for rid in param.ids:
-        if check.row(rid) != param.row(rid):
-            raise PatchError("Verificacao falhou: linha %d mudou." % rid)
-    if check.row(LOT_VIALS) != make_itemlot_row(BLOOD_VIAL_ID, vials):
-        raise PatchError("Verificacao falhou: linha nova incorreta.")
-    if check.row_count != param.row_count + 2:
-        raise PatchError("Verificacao falhou: contagem de linhas.")
-
-    new_bnd = bnd4_replace(bnd, entry, new_param)
-    if bnd4_get(new_bnd, bnd4_find(new_bnd, "ItemLotParam.param")) != new_param:
-        raise PatchError("Verificacao falhou: BND4.")
-    return dcx_compress(header, new_bnd)
+CALC_SUB, CALC_ASSIGN = 1, 5        # Event Value Operation: tipo de calculo
+CMP_GE = 4                          # Comparacao ">="
 
 
-def patch_common_emevd(raw):
+def topup_instrs(item_id, maximum, want, held, group):
+    """Completa item_id ate `maximum`:
+        want = maximum
+        held = quantidade que o jogador carrega
+        se held >= maximum: pula as duas proximas (evita valor negativo)
+        want = want - held
+        entrega `want` unidades direto no inventario"""
+    if not 1 <= maximum <= 99:
+        raise PatchError("Maximo deve estar entre 1 e 99.")
+    return [
+        Instr(2003, 41, struct.pack("<iIiiIb3x", want, VALUE_BITS, maximum, 0, 1, CALC_ASSIGN)),
+        Instr(2003, 42, struct.pack("<iiiI", EMEVD_GOODS, item_id, held, VALUE_BITS)),
+        Instr(3, 12, struct.pack("<b3xiBB2xI", group, held, VALUE_BITS, CMP_GE, maximum)),
+        Instr(1000, 1, struct.pack("<BBbx", 2, 1, group)),   # SKIP 2 se o grupo for verdadeiro
+        Instr(2003, 41, struct.pack("<iIiiIb3x", want, VALUE_BITS, 0, held, VALUE_BITS, CALC_SUB)),
+        Instr(2003, 43, struct.pack("<iiiI", EMEVD_GOODS, item_id, want, VALUE_BITS)),
+    ]
+
+
+def patch_common_emevd(raw, vials, bullets):
     header, data = dcx_decompress(raw)
     emevd = Emevd(data)
 
@@ -521,10 +249,19 @@ def patch_common_emevd(raw):
                          "Use os arquivos originais do jogo." % RESTOCK_EVENT_ID)
     if 0 not in ids:
         raise PatchError("Evento 0 nao encontrado no common.emevd.")
+    used = set(ids)
+    for ev in emevd.events:
+        for ins in ev.instrs:
+            for o in range(0, len(ins.args) - 3, 4):
+                used.add(struct.unpack_from("<I", ins.args, o)[0])
+    for base in (VIALS_WANT, VIALS_HELD, BULLETS_WANT, BULLETS_HELD):
+        if used & set(range(base, base + VALUE_BITS)):
+            raise PatchError("Flags %d-%d ja usadas pelo common.emevd; versao do jogo diferente?"
+                             % (base, base + VALUE_BITS - 1))
 
     restock = Event(RESTOCK_EVENT_ID, rest=0)
-    restock.instrs.append(Instr(2003, 4, struct.pack("<i", LOT_VIALS)))     # AwardItemLot
-    restock.instrs.append(Instr(2003, 4, struct.pack("<i", LOT_BULLETS)))   # AwardItemLot
+    restock.instrs += topup_instrs(BLOOD_VIAL_ID, vials, VIALS_WANT, VIALS_HELD, 1)
+    restock.instrs += topup_instrs(QUICKSILVER_BULLET_ID, bullets, BULLETS_WANT, BULLETS_HELD, 2)
     emevd.events.append(restock)
 
     ev0 = emevd.events[ids.index(0)]
@@ -564,17 +301,16 @@ def write_readme(out_dir, vials, bullets):
     text = """BB Restock - mod para Bloodborne
 
 Efeito: toda vez que a area carrega (respawn apos morte, viagem por lanterna,
-carregar o save) voce recebe {v} Blood Vials e {b} Quicksilver Bullets.
-O que passar do limite do inventario vai para o Armazem.
+carregar o save) seus Blood Vials sao completados ate {v} e suas Quicksilver
+Bullets ate {b}. So entra o que falta, direto no inventario: nada vai para o
+Armazem.
 
 Instalacao (em qualquer PC com a MESMA versao do jogo):
-  1. Faca backup dos originais:
-       dvdroot_ps4/param/gameparam/gameparam.parambnd.dcx
-       dvdroot_ps4/event/common.emevd.dcx
-  2. Copie a pasta dvdroot_ps4 deste mod por cima da pasta dvdroot_ps4 do jogo
-     (substituindo os dois arquivos).
+  bbport:  copie esta pasta para dentro de bbport-windows\\mods\\
+  shadPS4: faca backup de dvdroot_ps4\\event\\common.emevd.dcx do jogo e copie
+           a pasta dvdroot_ps4 deste mod por cima da do jogo.
 
-Desinstalar: restaure os dois arquivos originais.
+Desinstalar: apague a pasta do mod (bbport) ou restaure o arquivo original.
 """.format(v=vials, b=bullets)
     with open(os.path.join(out_dir, "LEIA-ME.txt"), "w", encoding="utf-8") as f:
         f.write(text)
@@ -584,43 +320,36 @@ def main():
     ap = argparse.ArgumentParser(description="Gera o mod BB Restock para Bloodborne.")
     ap.add_argument("game_dir", help="Pasta do jogo (contem dvdroot_ps4) ou a propria dvdroot_ps4")
     ap.add_argument("--out", default="BB_Restock_Mod", help="Pasta de saida (padrao: BB_Restock_Mod)")
-    ap.add_argument("--vials", type=int, default=20, help="Blood Vials por carregamento (1-99)")
-    ap.add_argument("--bullets", type=int, default=20, help="Quicksilver Bullets por carregamento (1-99)")
+    ap.add_argument("--vials", type=int, default=20,
+                    help="Completar Blood Vials ate este numero (padrao 20, o maximo do jogo)")
+    ap.add_argument("--bullets", type=int, default=20,
+                    help="Completar Quicksilver Bullets ate este numero (padrao 20, o maximo do jogo)")
     ap.add_argument("--install", action="store_true",
-                    help="Tambem instala direto no jogo (cria .bak dos originais)")
+                    help="Tambem instala direto no jogo (cria .bak do original)")
     args = ap.parse_args()
 
     try:
-        gp_path = find_file(args.game_dir, GAMEPARAM_REL)
         ev_path = find_file(args.game_dir, COMMON_EMEVD_REL)
-        print("gameparam: %s" % gp_path)
         print("common.emevd: %s" % ev_path)
-
-        with open(gp_path, "rb") as f:
-            new_gp = patch_gameparam(f.read(), args.vials, args.bullets)
-        print("ItemLotParam: lotes %d (frascos x%d) e %d (balas x%d) adicionados."
-              % (LOT_VIALS, args.vials, LOT_BULLETS, args.bullets))
         with open(ev_path, "rb") as f:
-            new_ev = patch_common_emevd(f.read())
-        print("common.emevd: evento %d adicionado e inicializado no evento 0." % RESTOCK_EVENT_ID)
+            new_ev = patch_common_emevd(f.read(), args.vials, args.bullets)
+        print("common.emevd: evento %d adicionado (completa frascos ate %d e balas ate %d)."
+              % (RESTOCK_EVENT_ID, args.vials, args.bullets))
 
-        outputs = [(gp_path, GAMEPARAM_REL, new_gp), (ev_path, COMMON_EMEVD_REL, new_ev)]
-        for _src, rel, content in outputs:
-            dst = os.path.join(args.out, "dvdroot_ps4", *rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "wb") as f:
-                f.write(content)
+        dst = os.path.join(args.out, "dvdroot_ps4", *COMMON_EMEVD_REL)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(new_ev)
         write_readme(args.out, args.vials, args.bullets)
         print("Mod gerado em: %s" % os.path.abspath(args.out))
 
         if args.install:
-            for src, _rel, content in outputs:
-                bak = src + ".bak"
-                if not os.path.exists(bak):
-                    shutil.copy2(src, bak)
-                with open(src, "wb") as f:
-                    f.write(content)
-            print("Instalado no jogo (originais salvos como .bak).")
+            bak = ev_path + ".bak"
+            if not os.path.exists(bak):
+                shutil.copy2(ev_path, bak)
+            with open(ev_path, "wb") as f:
+                f.write(new_ev)
+            print("Instalado no jogo (original salvo como .bak).")
     except PatchError as e:
         print("ERRO: %s" % e, file=sys.stderr)
         return 1

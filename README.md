@@ -1,17 +1,17 @@
 # BB Restock
 
-Mod para **Bloodborne** rodando no PC via [shadPS4](https://github.com/shadps4-emu/shadPS4):
-toda vez que a área carrega, você recebe **Blood Vials** e **Quicksilver Bullets**.
-Isso inclui o respawn após morrer, a viagem por lanterna e o carregamento do save.
-O que passar do limite do inventário vai para o Armazém, então você sempre volta
-com o inventário cheio e não precisa mais farmar.
+Mod para **Bloodborne** rodando no PC via [shadPS4](https://github.com/shadps4-emu/shadPS4)
+ou bbport: toda vez que a área carrega, seus **Blood Vials** e **Quicksilver Bullets**
+são completados até o máximo. Isso inclui o respawn após morrer, a viagem por
+lanterna e o carregamento do save. Só entra o que falta, direto no inventário:
+nada vai para o Armazém e você não precisa mais farmar.
 
 Este repositório **não contém arquivos do jogo**. Ele traz um script que gera o
 mod a partir da sua própria cópia do Bloodborne.
 
-> **Status:** os formatos de arquivo foram verificados com testes automatizados
-> (veja [Testes](#testes)), mas o mod ainda **não foi validado dentro do jogo**.
-> Relatos de funcionamento são bem-vindos via *issues*.
+> **Status:** testado no jogo (versão 1.09, bbport). Os formatos de arquivo também
+> são verificados com testes automatizados (veja [Testes](#testes)).
+> Relatos de funcionamento em outras configurações são bem-vindos via *issues*.
 
 ## Requisitos
 
@@ -31,62 +31,61 @@ Os arquivos originais **não são alterados**. O mod é gravado em `BB_Restock_M
 BB_Restock_Mod/
 ├── LEIA-ME.txt
 └── dvdroot_ps4/
-    ├── event/common.emevd.dcx
-    └── param/gameparam/gameparam.parambnd.dcx
+    └── event/common.emevd.dcx
 ```
 
 | Opção | Padrão | Descrição |
 |---|---|---|
-| `--vials N` | 20 | Blood Vials entregues por carregamento (1–99) |
-| `--bullets N` | 20 | Quicksilver Bullets entregues por carregamento (1–99) |
+| `--vials N` | 20 | Completar Blood Vials até N (1–99; 20 é o máximo do jogo) |
+| `--bullets N` | 20 | Completar Quicksilver Bullets até N (1–99; 20 é o máximo do jogo) |
 | `--out PASTA` | `BB_Restock_Mod` | Pasta de saída |
-| `--install` | desligado | Também instala no jogo, salvando os originais como `.bak` |
+| `--install` | desligado | Também instala no jogo, salvando o original como `.bak` |
 
-Se os arquivos tiverem um formato inesperado ou já tiverem sido modificados, o
+Se o arquivo tiver um formato inesperado ou já tiver sido modificado, o
 script para com uma mensagem de erro e não grava nada.
 
 ## Instalar (em qualquer PC)
 
-1. Faça backup destes dois arquivos do jogo:
-   - `dvdroot_ps4/param/gameparam/gameparam.parambnd.dcx`
-   - `dvdroot_ps4/event/common.emevd.dcx`
+**bbport:** copie a pasta gerada para `bbport-windows\mods\` (uma pasta por mod).
+O launcher ativa o mod sozinho, e os arquivos do jogo não são alterados.
+
+**shadPS4:**
+
+1. Faça backup de `dvdroot_ps4/event/common.emevd.dcx`.
 2. Copie a pasta `dvdroot_ps4` gerada por cima da `dvdroot_ps4` do jogo.
 
-Para instalar em outros PCs, basta copiar os mesmos dois arquivos. O PC de
-destino precisa ter a **mesma versão do jogo** (mesmo update e DLC) usada para
-gerar o mod. Se a versão for diferente, gere o mod de novo naquele PC.
+Para instalar em outros PCs, basta copiar o mesmo arquivo. O PC de destino
+precisa ter a **mesma versão do jogo** (mesmo update e DLC) usada para gerar
+o mod. Se a versão for diferente, gere o mod de novo naquele PC.
 
-**Desinstalar:** restaure os dois arquivos originais (ou os `.bak`).
+**Desinstalar:** apague a pasta do mod (bbport) ou restaure o arquivo original (`.bak`).
 
 ## Como funciona
 
-O mod adiciona duas coisas ao jogo:
+O mod adiciona um evento novo (`9990000`) ao `common.emevd` e o inicializa no
+começo do evento `0`, que o jogo executa a cada carregamento de área. Para cada
+item, o evento faz:
 
-1. **`ItemLotParam`** (em `gameparam.parambnd.dcx`): dois "lotes de itens" novos.
+```
+quero   = máximo                                   2003[41] Event Value Operation (atribuir)
+tenho   = quantidade no inventário                 2003[42] Store Item Amount Held in Event Value
+se tenho >= máximo: pula as duas próximas          3[12] IF Event Value + 1000[01] SKIP
+quero   = quero - tenho                            2003[41] Event Value Operation (subtrair)
+entrega "quero" unidades direto no inventário      2003[43] Directly Give Player Item
+```
 
-   | Lote | Item | Categoria | Chance | Flag de coleta |
-   |---|---|---|---|---|
-   | `9990000` | Blood Vial (`1000`) | Goods (`4`) | 100% | nenhuma (`-1`) |
-   | `9990002` | Quicksilver Bullets (`900`) | Goods (`4`) | 100% | nenhuma (`-1`) |
+É o mesmo padrão que o próprio jogo usa no evento `12101021` de
+`m21_00_00_00.emevd` para completar Quicksilver Bullets. A verificação
+`tenho >= máximo` evita que a subtração fique negativa (por exemplo, com uma
+runa que aumenta o limite).
 
-   Sem flag de coleta, o lote pode ser recebido infinitas vezes. Os IDs
-   `9990001` e `9990003` ficam livres de propósito: o jogo entrega lotes de
-   IDs consecutivos em cadeia.
-
-2. **`common.emevd`**: um evento novo (`9990000`) que executa `AwardItemLot`
-   nos dois lotes. Ele é inicializado no começo do evento `0`, que o jogo
-   executa a cada carregamento de área.
-
-O jogo já repõe frascos e balas a partir do Armazém ao morrer ou descansar. O
-mod garante que sempre haja estoque.
+As variáveis ficam nos valores de evento de 8 bits em `6960`, `6970`, `6980` e
+`6990`. Nenhum evento ou script de diálogo do jogo usa a faixa `6960–6999`, e
+o script recusa a operação se o `common.emevd` usar alguma delas.
 
 ### Detalhes técnicos
 
 - **DCX:** descomprimido e recomprimido com zlib (DFLT), mantendo o cabeçalho original.
-- **BND4:** o `ItemLotParam.param` modificado é anexado ao fim do arquivo e só o
-  cabeçalho dele é atualizado. Nomes, tabela de hash e os demais params ficam intactos.
-- **PARAM:** as linhas novas são inseridas em ordem de ID. Todas as linhas
-  originais são relidas e comparadas byte a byte após a gravação.
 - **EMEVD:** o arquivo é interpretado e regravado no layout do Bloodborne
   (64-bit, versão `0xCC`). Antes de qualquer alteração, o script confirma que a
   regravação preserva o conteúdo. Os índices de parâmetros do evento 0 são
@@ -94,22 +93,21 @@ mod garante que sempre haja estoque.
 
 ## Limitações conhecidas
 
-- A entrega também acontece em viagens por lanterna e ao carregar o save, não só ao morrer.
-- Pode aparecer o aviso de "item recebido" a cada carregamento.
-- O Armazém tem um limite; o que passar dele é perdido.
-- Feito para a versão de PS4 usada no shadPS4. Outras versões podem ter um
-  `ItemLotParam` diferente; nesse caso o script recusa a operação.
+- A reposição também acontece em viagens por lanterna e ao carregar o save, não só ao morrer.
+- Com uma runa que aumenta o limite acima de 20, gere o mod com `--vials`/`--bullets` maiores.
+- Itens que já estão no Armazém continuam lá; o mod só não adiciona mais.
+- Feito para a versão 1.09 de PS4 usada no shadPS4/bbport.
 
 ## Testes
 
 `tests/run_tests.sh` faz um teste de ponta a ponta:
 
 1. Gera, com a [SoulsFormatsNEXT](https://github.com/soulsmods/SoulsFormatsNEXT),
-   arquivos sintéticos no formato do Bloodborne, em 4 variações de cabeçalho PARAM/BND4.
+   arquivos sintéticos no formato do Bloodborne.
 2. Roda o `bb_restock.py` sobre eles.
 3. Relê o resultado com a SoulsFormats e verifica que:
-   - as linhas, arquivos e eventos originais não mudaram;
-   - os lotes e o evento novos estão corretos;
+   - os eventos originais não mudaram;
+   - o evento novo e a inicialização no evento 0 estão corretos;
    - rodar o script sobre arquivos já modificados é recusado.
 
 Requer `git`, `python3` e .NET SDK 8 ou mais recente:
@@ -121,8 +119,7 @@ bash tests/run_tests.sh
 ## Créditos
 
 - [SoulsFormatsNEXT](https://github.com/soulsmods/SoulsFormatsNEXT): referência
-  dos formatos DCX, BND4, PARAM e EMEVD; usada nos testes.
-- [Smithbox](https://github.com/vawser/Smithbox): definições de params do Bloodborne.
+  dos formatos DCX e EMEVD; usada nos testes.
 - [DarkScript3](https://github.com/AinTunez/DarkScript3): definições das instruções EMEVD.
 
 ## Licença
